@@ -13,16 +13,19 @@ With the `global` feature enabled, the
 
 #[cfg(feature = "global")]
 mod global;
+mod shard;
+mod table;
 use ahash::AHasher;
 #[cfg(feature = "global")]
 pub use global::GlobalSymbol;
+use shard::{hash_one, Shard};
+pub use table::Table;
 
 use std::{
     hash::{BuildHasher, Hash},
     num::NonZeroU32,
 };
 
-use hashbrown::hash_map::{HashMap, RawEntryMut};
 use std::sync::Mutex;
 
 /// A `BuildHasher` that builds a determinstically seeded AHasher
@@ -78,52 +81,13 @@ impl<const N: usize, S: BuildHasher> SymbolTable<N, S> {
     }
 }
 
-#[derive(Default)]
-struct Shard {
-    map: HashMap<u32, (), ()>,
-    strs: Vec<Box<str>>,
-}
-
-impl Shard {
-    fn intern(&mut self, hash: u64, string: &str, build_hasher: &impl BuildHasher) -> u32 {
-        let entry = self
-            .map
-            .raw_entry_mut()
-            .from_hash(hash, |&idx| string == self.strs[idx as usize].as_ref());
-
-        let index = match entry {
-            RawEntryMut::Occupied(e) => *e.key(),
-            RawEntryMut::Vacant(e) => {
-                let idx = self.strs.len() as u32;
-                self.strs.push(string.into());
-
-                *e.insert_with_hasher(hash, idx, (), |&idx| {
-                    hash_one(build_hasher, self.strs[idx as usize].as_ref())
-                })
-                .0
-            }
-        };
-
-        debug_assert!(!self.strs.is_empty());
-        debug_assert!(!self.map.is_empty());
-        index
-    }
-}
-
 impl<const N: usize, S: Default + BuildHasher> Default for SymbolTable<N, S> {
     fn default() -> Self {
         Self::with_hasher(S::default())
     }
 }
 
-#[inline(always)]
-fn hash_one(build_hasher: &impl BuildHasher, string: &str) -> u64 {
-    let mut hasher = build_hasher.build_hasher();
-    string.hash(&mut hasher);
-    std::hash::Hasher::finish(&hasher)
-}
-
-impl<const N: usize, S: BuildHasher> SymbolTable<N, S> {
+impl<const N: usize, S: BuildHasher> Table for SymbolTable<N, S> {
     /// Intern a string into the [`SymbolTable`].
     ///
     /// Note how this method only takes `&self`, so it can be used concurrently.
@@ -134,7 +98,7 @@ impl<const N: usize, S: BuildHasher> SymbolTable<N, S> {
     /// let mut table = symbol_table::SymbolTable::new();
     /// assert_eq!(table.intern("foo"), table.intern("foo"));
     /// ```
-    pub fn intern(&self, string: &str) -> Symbol {
+    fn intern(&self, string: &str) -> Symbol {
         let hash = hash_one(&self.build_hasher, string);
         let shard_i = hash as usize % N;
         // println!("Interning into shard {shard_i}");
@@ -159,7 +123,7 @@ impl<const N: usize, S: BuildHasher> SymbolTable<N, S> {
     /// let foo = table.intern("foo");
     /// assert_eq!(table.resolve(foo), "foo");
     /// ```
-    pub fn resolve(&self, sym: Symbol) -> &str {
+    fn resolve(&self, sym: Symbol) -> &str {
         let shard_i = sym.0.get() >> (32 - Self::SHARD_BITS);
         debug_assert!(shard_i < N as u32);
         // println!("Resolving from shard {shard_i}");
@@ -184,7 +148,7 @@ impl<const N: usize, S: BuildHasher> SymbolTable<N, S> {
 
 /// An interned symbol.
 ///
-/// Resolve it back to the string by using [`SymbolTable::resolve`]
+/// Resolve it back to the string by using [`Table::resolve`]
 ///
 /// Internally, this is a [`NonZeroU32`], so it will be niche-optimized.
 ///
